@@ -1,0 +1,1140 @@
+openapi: 3.1.0
+info:
+  title: QPost Native API
+  version: "3.0.0"
+  summary: Native JSON API for QPost, mounted at /qp/v3, alongside the Mailgun-compatible /v3 surface.
+  description: |
+    ## What this is
+
+    QPost exposes three parallel API surfaces on the same backend:
+
+    | Surface | Path prefix | Wire format | Status |
+    | --- | --- | --- | --- |
+    | Mailgun-compatible | `/v3/{domain}/...` | form-encoded, HTTP Basic (`api:<key>`) | shipped |
+    | **Native QPost (this spec)** | **`/qp/v3/...`** | JSON, Bearer | this document |
+    | SendGrid-compatible | `/v3/mail/send`-style | JSON, Bearer | planned, not yet built |
+
+    All three sit on top of the same internal domain model (`SendCommand`, `SendService`, `DomainService`,
+    `EventService`, etc.) — they are wire-format adapters over one product, not three separate products.
+    The `/qp` prefix keeps this surface from ever colliding with the existing Mailgun-compatible paths
+    (which are unprefixed `/v3/...` and already live in production) or the planned SendGrid surface.
+
+    ## Versioning contract: v3 → v4 via NVP extension fields
+
+    This is v3. A future v4 is where breaking changes land. Between v3 and v4, the API evolves *without*
+    breaking changes by using a **freeform name/value pair (NVP) extension field** attached to the
+    handful of objects judged most likely to gain new attributes: `Message` (send request and response),
+    `Domain`, `Event`, `Suppression`, and `Tenant`.
+
+    This field is called `metadata` on each of those objects. It is **additive only** — it exists
+    alongside every existing structured field (headers, tags, user variables, etc.) and never replaces
+    them. Clients that don't understand a new capability yet can safely ignore unrecognized entries in
+    `metadata`; clients that need an early, unversioned way to read or write a not-yet-formalized
+    attribute can do so through it. When a name/value pair proves durable and widely used, it gets
+    promoted to a proper first-class field in v4 rather than staying in `metadata` forever.
+
+    Objects that are simple, stable, and not expected to change before v4 (`IpPool`, `AccountStatus`,
+    `DnsRecord`) do **not** carry a `metadata` field — the escape hatch is deliberately scoped to
+    evolution-prone objects, not applied blanket across the API.
+
+    ## Authentication
+
+    `Authorization: Bearer <tenant-api-key>` — the **same tenant API key** already used as the Mailgun
+    Basic-auth password (`api:<key>`). There is no separate native credential; `AuthenticationService`
+    accepts either presentation of the same key. Rotate/manage keys the same way regardless of which
+    surface you call.
+
+    ## Tenant = Domain = SES identity = SES tenant
+
+    QPost's multi-tenant model is designed to line up 1:1 with Amazon SES's own tenant/identity model
+    (see `docs/ses-resource-model.md` for the full rationale):
+
+    - **One QPost Tenant ↔ one SES tenant** (SES v2 multi-tenant management), named `qpost-<slug>`.
+    - **One SES configuration set per Tenant** (not per domain), reused by every domain the tenant owns,
+      also named `qpost-<slug>`. This is what gives a tenant isolated reputation/pause controls on the
+      SES side.
+    - **One QPost Domain ↔ one SES identity**, provisioned on the delegated subdomain (`qp.<domain>`)
+      and associated to the tenant's SES tenant.
+
+    **Status note:** the `slug`, per-tenant SES tenant, and per-tenant configuration set are *new*
+    concepts this spec introduces on top of the current implementation. As built today, `Tenant` has no
+    SES-side representation at all, and `ses_configuration_set_name` lives on `Domain` (one config set
+    per domain, unkeyed to tenant) — see `docs/ses-resource-model.md`, "Current state". This spec
+    reflects the *target* alignment; the `sesAlignment` blocks below are marked `readOnly` and will
+    report `"status": "not_provisioned"` until the SDK bump and `sesv2` migration described in that doc
+    ships. Flagging this explicitly per "ask in case of doubt": if a different tenant/SES mapping is
+    intended, this is the section to correct.
+
+    ## Pagination
+
+    List endpoints return `{ "items": [...], "paging": {...} }` with a plain page/limit/total shape
+    (unlike the Mailgun-compatible surface's URL-only `first`/`last`/`next`/`previous`, which exists
+    solely to satisfy `mailgun.js`'s `new URL()` calls on every paging field). Native clients get real
+    numbers.
+
+  contact:
+    name: QPost
+    url: https://qern.org
+  license:
+    name: Proprietary
+    url: https://qern.org/legal/eula
+
+servers:
+  - url: https://qpost.qern.net/qp/v3
+    description: Production
+  - url: http://localhost:8080/qp/v3
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Tenant
+    description: The authenticated tenant and its SES alignment status.
+  - name: Domains
+    description: Sending domains, their DNS/verification state, tracking settings, and SES identity alignment.
+  - name: Messages
+    description: Sending email (JSON body or raw MIME).
+  - name: Events
+    description: Delivery, engagement, bounce, and complaint event history.
+  - name: Suppressions
+    description: Bounce, complaint, and unsubscribe suppression lists.
+  - name: IP Pools
+    description: Dedicated sending IP pool management.
+  - name: Account
+    description: Account-wide sending status and limits.
+
+paths:
+  /tenant:
+    get:
+      operationId: getCurrentTenant
+      tags: [Tenant]
+      summary: Get the authenticated tenant
+      description: Returns the tenant identified by the bearer token, including its SES alignment status.
+      responses:
+        "200":
+          description: The current tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /domains:
+    get:
+      operationId: listDomains
+      tags: [Domains]
+      summary: List domains
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of domains
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createDomain
+      tags: [Domains]
+      summary: Add a domain
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDomainRequest"
+      responses:
+        "201":
+          description: Domain created (pending verification)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Domain"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Domain already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /domains/{domain}:
+    parameters:
+      - $ref: "#/components/parameters/DomainPath"
+    get:
+      operationId: getDomain
+      tags: [Domains]
+      summary: Get a domain
+      responses:
+        "200":
+          description: The domain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Domain"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteDomain
+      tags: [Domains]
+      summary: Remove a domain
+      responses:
+        "204":
+          description: Domain removed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /domains/{domain}/dns-records:
+    parameters:
+      - $ref: "#/components/parameters/DomainPath"
+    get:
+      operationId: getDomainDnsRecords
+      tags: [Domains]
+      summary: Get required DNS records
+      description: >-
+        Returns the DNS records the customer must publish. For delegated domains
+        (`sesAlignment.delegatedSubdomain` set) this is a single NS record at the apex; QPost manages
+        SPF/DKIM inside the delegated zone automatically. For legacy apex-provisioned domains this
+        returns the full SPF/DKIM/tracking record set.
+      responses:
+        "200":
+          description: DNS records required for this domain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DnsRecordSet"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /domains/{domain}/tracking:
+    parameters:
+      - $ref: "#/components/parameters/DomainPath"
+    get:
+      operationId: getDomainTracking
+      tags: [Domains]
+      summary: Get open/click tracking settings
+      responses:
+        "200":
+          description: Tracking settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrackingSettings"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateDomainTracking
+      tags: [Domains]
+      summary: Update open/click tracking settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrackingSettings"
+      responses:
+        "200":
+          description: Updated tracking settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrackingSettings"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /domains/{domain}/delegation:
+    parameters:
+      - $ref: "#/components/parameters/DomainPath"
+    post:
+      operationId: migrateDomainDelegation
+      tags: [Domains]
+      summary: Migrate a domain onto a delegated subdomain
+      description: >-
+        Moves a legacy apex-provisioned domain onto the `qp.<domain>` delegated-subdomain model
+        (one Route 53 hosted zone per domain, NS-delegated from the customer's apex). Idempotent;
+        safe to call again to re-fetch nameservers.
+      responses:
+        "200":
+          description: Delegation migration started or already complete
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Domain"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /domains/{domain}/stats:
+    parameters:
+      - $ref: "#/components/parameters/DomainPath"
+    get:
+      operationId: getDomainStats
+      tags: [Domains]
+      summary: Get domain sending statistics
+      description: >-
+        All-time event counts by type for this domain. Backed directly by `EventService.statsSummary`
+        (a `GROUP BY event_type` count) — there is no date-range or resolution breakdown in the current
+        implementation, so this endpoint intentionally has no query parameters. A time-series version
+        (start/end/resolution) is plausible future work, not modeled here since it doesn't exist yet.
+      responses:
+        "200":
+          description: All-time event counts for the domain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainStats"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /domains/{domain}/ghost-config:
+    parameters:
+      - $ref: "#/components/parameters/DomainPath"
+    get:
+      operationId: getGhostConfig
+      tags: [Domains]
+      summary: Get a ready-to-use Ghost CMS bulk-email config snippet
+      responses:
+        "200":
+          description: Ghost configuration snippet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GhostConfig"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /messages:
+    post:
+      operationId: sendMessage
+      tags: [Messages]
+      summary: Send a message
+      description: >-
+        Native JSON equivalent of the Mailgun-compatible `POST /v3/{domain}/messages`. `domain` is
+        optional in the body — if omitted, it's inferred from the `from` address — since the native
+        surface doesn't require a domain path segment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+      responses:
+        "200":
+          description: Message queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendMessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /messages/mime:
+    post:
+      operationId: sendMimeMessage
+      tags: [Messages]
+      summary: Send a raw MIME message
+      description: Native equivalent of `POST /v3/{domain}/messages.mime`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/SendMimeMessageRequest"
+      responses:
+        "200":
+          description: Message queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendMessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /events:
+    get:
+      operationId: listEvents
+      tags: [Events]
+      summary: List events
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+        - name: event
+          in: query
+          description: Filter to a single event type
+          schema:
+            $ref: "#/components/schemas/EventType"
+        - name: recipient
+          in: query
+          schema: { type: string, format: email }
+        - name: message_id
+          in: query
+          schema: { type: string }
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /suppressions/{listType}:
+    parameters:
+      - $ref: "#/components/parameters/SuppressionListType"
+    get:
+      operationId: listSuppressions
+      tags: [Suppressions]
+      summary: List suppressed addresses
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of suppressions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuppressionList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: addSuppression
+      tags: [Suppressions]
+      summary: Add a single suppressed address
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSuppressionRequest"
+      responses:
+        "201":
+          description: Suppression added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Suppression"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /suppressions/{listType}/import:
+    parameters:
+      - $ref: "#/components/parameters/SuppressionListType"
+    post:
+      operationId: importSuppressions
+      tags: [Suppressions]
+      summary: Bulk-import suppressed addresses
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/CreateSuppressionRequest"
+      responses:
+        "200":
+          description: Import result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported:
+                    type: integer
+                    description: Number of addresses imported
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /suppressions/{listType}/{address}:
+    parameters:
+      - $ref: "#/components/parameters/SuppressionListType"
+      - name: address
+        in: path
+        required: true
+        schema: { type: string, format: email }
+    delete:
+      operationId: deleteSuppression
+      tags: [Suppressions]
+      summary: Remove a suppressed address
+      parameters:
+        - name: domain
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: Suppression removed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /ip-pools:
+    get:
+      operationId: listIpPools
+      tags: [IP Pools]
+      summary: List IP pools
+      responses:
+        "200":
+          description: IP pools
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IpPool"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: createIpPool
+      tags: [IP Pools]
+      summary: Create an IP pool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: IP pool created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IpPool"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /ip-pools/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      operationId: deleteIpPool
+      tags: [IP Pools]
+      summary: Delete an IP pool
+      responses:
+        "204":
+          description: IP pool deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /ip-pools/{name}/ips:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: addIpToPool
+      tags: [IP Pools]
+      summary: Add an IP to a pool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ip]
+              properties:
+                ip: { type: string, format: ipv4 }
+      responses:
+        "200":
+          description: IP added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IpPool"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /ips:
+    get:
+      operationId: listIps
+      tags: [IP Pools]
+      summary: List all dedicated IPs
+      responses:
+        "200":
+          description: Dedicated IPs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    ip: { type: string, format: ipv4 }
+                    pool: { type: string }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /account:
+    get:
+      operationId: getAccountStatus
+      tags: [Account]
+      summary: Get account sending status
+      responses:
+        "200":
+          description: Account sending status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Tenant API key. Identical key to the Mailgun-compatible surface's Basic-auth password.
+
+  parameters:
+    DomainPath:
+      name: domain
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 300, default: 100 }
+    SuppressionListType:
+      name: listType
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [bounces, complaints, unsubscribes]
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        message:
+          type: ["string", "null"]
+
+    NameValuePair:
+      type: object
+      required: [name, value]
+      description: One freeform, forward-compatibility extension entry. See the versioning section above.
+      properties:
+        name:
+          type: string
+          maxLength: 128
+        value:
+          type: ["string", "null"]
+          maxLength: 4096
+
+    Paging:
+      type: object
+      properties:
+        page:
+          type: integer
+        limit:
+          type: integer
+        total_items:
+          type: ["integer", "null"]
+          description: Null when the total isn't cheaply computable; use has_more to drive further paging regardless.
+        has_more:
+          type: boolean
+
+    Tenant:
+      type: object
+      description: >-
+        The authenticated tenant. `sesAlignment` reflects the target tenant=domain=identity=SES-tenant
+        model described in docs/ses-resource-model.md; see this spec's top-level description for status.
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: ["string", "null"]
+          description: >-
+            Stable tenant slug used to key SES-side resources (`qpost-<slug>`). New field, not present
+            on `Tenant` today — introduced by this spec per docs/ses-resource-model.md's recommendation.
+        rateLimitRps:
+          type: integer
+        rateLimitBurst:
+          type: integer
+        sesAlignment:
+          $ref: "#/components/schemas/TenantSesAlignment"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameValuePair"
+
+    TenantSesAlignment:
+      type: object
+      readOnly: true
+      properties:
+        status:
+          type: string
+          enum: [not_provisioned, provisioning, active, paused]
+          description: not_provisioned until the sesv2 tenant-management migration ships.
+        sesTenantName:
+          type: ["string", "null"]
+          description: "e.g. qpost-<slug>"
+        sesConfigurationSetName:
+          type: ["string", "null"]
+          description: One configuration set per tenant, shared by all of the tenant's domains.
+
+    CreateDomainRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "^[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+
+    Domain:
+      type: object
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [pending, verified, failed]
+        type:
+          type: string
+          const: custom
+        wildcard:
+          type: boolean
+        trackingCname:
+          type: ["string", "null"]
+        sesAlignment:
+          $ref: "#/components/schemas/DomainSesAlignment"
+        createdAt:
+          type: string
+          format: date-time
+        verifiedAt:
+          type: ["string", "null"]
+          format: date-time
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameValuePair"
+
+    DomainSesAlignment:
+      type: object
+      readOnly: true
+      description: How this domain maps to an SES identity, and whether it's associated to its tenant's SES tenant.
+      properties:
+        delegatedSubdomain:
+          type: ["string", "null"]
+          description: "e.g. qp.example.com — null for legacy apex-provisioned domains."
+        sesIdentity:
+          type: ["string", "null"]
+          description: The SES identity name backing this domain (delegatedSubdomain, or the apex domain for legacy domains).
+        route53ZoneId:
+          type: ["string", "null"]
+        associatedToSesTenant:
+          type: boolean
+          description: Whether this identity is associated to the owning tenant's SES tenant. False until that migration ships.
+
+    DnsRecord:
+      type: object
+      properties:
+        recordType:
+          type: string
+          enum: [NS, TXT, CNAME, MX]
+        name:
+          type: string
+        value:
+          type: string
+        ttl:
+          type: integer
+
+    DnsRecordSet:
+      type: object
+      properties:
+        domain:
+          type: string
+        delegated:
+          type: boolean
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/DnsRecord"
+
+    TrackingSettings:
+      type: object
+      properties:
+        opens:
+          type: boolean
+        clicks:
+          type: boolean
+
+    DomainStats:
+      type: object
+      description: >-
+        All-time event counts by type, e.g. delivered=120, opened=45, bounced=2.
+      properties:
+        domain:
+          type: string
+        counts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Keyed by event type (see EventType); only types with at least one event appear.
+
+    GhostConfig:
+      type: object
+      properties:
+        domain:
+          type: string
+        state:
+          type: string
+          enum: [active, unverified]
+        baseUrl:
+          type: string
+        apiKey:
+          type: string
+          description: Placeholder — never echoes the real key.
+        yaml:
+          type: string
+        instructions:
+          type: array
+          items:
+            type: string
+
+    SendMessageRequest:
+      type: object
+      required: [from, to, subject]
+      description: >-
+        Native JSON equivalent of the Mailgun form fields handled by MailgunMessageParser. Structured
+        fields below (tags, userVariables, etc.) are unchanged from the Mailgun surface's semantics —
+        `metadata` is an additional escape hatch, not a replacement for any of them.
+      properties:
+        domain:
+          type: ["string", "null"]
+          description: Optional; inferred from `from` if omitted.
+        from:
+          type: string
+          format: email
+        to:
+          type: array
+          items: { type: string, format: email }
+          minItems: 1
+        cc:
+          type: array
+          items: { type: string, format: email }
+        bcc:
+          type: array
+          items: { type: string, format: email }
+        replyTo:
+          type: array
+          items: { type: string, format: email }
+        subject:
+          type: string
+        html:
+          type: ["string", "null"]
+        text:
+          type: ["string", "null"]
+        tags:
+          type: array
+          items: { type: string }
+        testMode:
+          type: boolean
+          default: false
+        trackingOpens:
+          type: ["boolean", "null"]
+        trackingClicks:
+          type: ["boolean", "null"]
+        recipientVariables:
+          type: ["object", "null"]
+          description: Keyed by recipient address, for %recipient.field% personalization.
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        userVariables:
+          type: object
+          description: "Custom variables (Mailgun's v: prefix), echoed back on events as user-variables."
+          additionalProperties:
+            type: string
+        campaignId:
+          type: ["string", "null"]
+        scheduledFor:
+          type: ["string", "null"]
+          format: date-time
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameValuePair"
+
+    SendMimeMessageRequest:
+      type: object
+      required: [message, to]
+      properties:
+        message:
+          type: string
+          format: binary
+          description: Raw RFC 822 MIME message.
+        to:
+          type: array
+          items: { type: string, format: email }
+
+    SendMessageResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        message:
+          type: string
+          const: "Queued. Thank you."
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameValuePair"
+
+    EventType:
+      type: string
+      enum: [delivered, opened, clicked, bounced, complained, failed, accepted, rejected, unsubscribed]
+
+    GeoLocation:
+      type: object
+      properties:
+        country: { type: ["string", "null"] }
+        region: { type: ["string", "null"] }
+        city: { type: ["string", "null"] }
+
+    ClientInfo:
+      type: object
+      properties:
+        clientOs: { type: ["string", "null"] }
+        clientName: { type: ["string", "null"] }
+        clientType: { type: ["string", "null"] }
+        deviceType: { type: ["string", "null"] }
+        userAgent: { type: ["string", "null"] }
+
+    DeliveryStatus:
+      type: object
+      description: Present only on failed events.
+      properties:
+        code: { type: ["integer", "null"] }
+        message: { type: ["string", "null"] }
+        description: { type: ["string", "null"] }
+
+    Event:
+      type: object
+      properties:
+        id:
+          type: string
+        event:
+          $ref: "#/components/schemas/EventType"
+        timestamp:
+          type: number
+          description: Epoch seconds with millisecond fraction.
+        recipient:
+          type: string
+          format: email
+        severity:
+          type: ["string", "null"]
+          enum: [permanent, temporary, null]
+        reason:
+          type: ["string", "null"]
+        url:
+          type: ["string", "null"]
+          description: Present on click events.
+        deliveryStatus:
+          oneOf:
+            - $ref: "#/components/schemas/DeliveryStatus"
+            - type: "null"
+        messageId:
+          type: string
+        userVariables:
+          type: object
+          additionalProperties: { type: string }
+        geolocation:
+          $ref: "#/components/schemas/GeoLocation"
+        clientInfo:
+          $ref: "#/components/schemas/ClientInfo"
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameValuePair"
+
+    EventList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Event"
+        paging:
+          $ref: "#/components/schemas/Paging"
+
+    DomainList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Domain"
+        paging:
+          $ref: "#/components/schemas/Paging"
+
+    CreateSuppressionRequest:
+      type: object
+      required: [address]
+      properties:
+        address:
+          type: string
+          format: email
+        error:
+          type: ["string", "null"]
+          description: e.g. an SMTP status/reason, for bounce imports.
+
+    Suppression:
+      type: object
+      properties:
+        address:
+          type: string
+          format: email
+        listType:
+          type: string
+          enum: [bounces, complaints, unsubscribes]
+        reason:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+          format: date-time
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/NameValuePair"
+
+    SuppressionList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Suppression"
+        paging:
+          $ref: "#/components/schemas/Paging"
+
+    IpPool:
+      type: object
+      properties:
+        name:
+          type: string
+        ips:
+          type: array
+          items:
+            type: string
+            format: ipv4
+
+    AccountStatus:
+      type: object
+      properties:
+        sendingEnabled:
+          type: boolean
+        max24HourSend:
+          type: integer
+        maxSendRate:
+          type: number
+        sentLast24Hours:
+          type: integer
+        reputationStatus:
+          type: string

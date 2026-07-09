@@ -1,0 +1,46 @@
+{
+  "name": "@dyanet/qpost",
+  "version": "3.0.0",
+  "description": "Typed TypeScript client for the native QPost API (/qp/v3).",
+  "license": "MIT",
+  "author": "QPost",
+  "homepage": "https://qern.org",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qern-net/qpost-sdk.git",
+    "directory": "npm"
+  },
+  "keywords": ["qpost", "ses", "email", "transactional-email", "amazon-ses"],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "generate-types": "openapi-typescript ./openapi/qpost-v3-openapi.yaml -o src/schema.gen.ts",
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "openapi-fetch": "^0.13.0"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.4.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
