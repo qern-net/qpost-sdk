@@ -23,6 +23,8 @@ jobs:
   build:
     name: typecheck + build + test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # commit the refreshed coverage badge on main
     steps:
       - uses: actions/checkout@v4
 
@@ -46,11 +48,33 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test
-        run: npm test
+      - name: Test + coverage
+        run: npm run test:coverage
 
       - name: Build
         run: npm run build
+
+      # Self-hosted coverage badge (no Codecov): render the vitest summary into a shields endpoint
+      # JSON that the README badge points at. Regenerated every run; committed back on main.
+      - name: Update coverage badge
+        working-directory: .
+        run: |
+          node <<'EOF'
+          const fs = require("fs");
+          const pct = JSON.parse(fs.readFileSync("npm/coverage/coverage-summary.json", "utf8")).total.lines.pct;
+          const color = pct>=90?"brightgreen":pct>=80?"green":pct>=70?"yellowgreen":pct>=60?"yellow":pct>=50?"orange":"red";
+          fs.mkdirSync(".github/badges", { recursive: true });
+          fs.writeFileSync(".github/badges/coverage.json",
+            JSON.stringify({ schemaVersion: 1, label: "coverage", message: pct.toFixed(1) + "%", color }, null, 2) + "\n");
+          console.log("coverage badge:", pct + "%");
+          EOF
+
+      - name: Commit coverage badge (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update coverage badge [skip ci]"
+          file_pattern: .github/badges/coverage.json
 
   publish:
     name: publish to npmjs
