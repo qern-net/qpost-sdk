@@ -35,8 +35,9 @@ jobs:
       - name: Install
         run: npm ci
 
-      # The vendored OpenAPI spec (openapi/qpost-v3-openapi.yaml) is the source of truth; the generated
-      # client types must always be a byte-for-byte regeneration of it.
+      # The repo-root OpenAPI spec (../qpost-v3-openapi.yaml) is the source of truth for the generated
+      # types; they must always be a byte-for-byte regeneration of it. (The hand-written client layer
+      # on top is not generated and is not checked here.)
       - name: Verify generated types are up to date
         run: |
           npm run generate-types

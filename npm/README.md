@@ -1,8 +1,10 @@
 # @dyanet/qpost
 
-Typed TypeScript client for the native QPost API (`/qp/v3`) — generated from
-[`openapi/qpost-v3-openapi.yaml`](./openapi/qpost-v3-openapi.yaml) via
-[`openapi-typescript`](https://openapi-ts.dev) + [`openapi-fetch`](https://openapi-ts.dev/openapi-fetch/).
+Typed TypeScript client for the native QPost API (`/qp/v3`). The generated types
+(`src/schema.gen.ts`) come from the repo-root OpenAPI spec
+[`qpost-v3-openapi.yaml`](../qpost-v3-openapi.yaml) via
+[`openapi-typescript`](https://openapi-ts.dev); the client surface on top is hand-written for
+ergonomics ([`openapi-fetch`](https://openapi-ts.dev/openapi-fetch/) under the hood).
 
 This targets the **native QPost API**, not the Mailgun- or SendGrid-compatible surfaces. If you're
 migrating an existing Mailgun or SendGrid integration, keep using `mailgun.js` / `@sendgrid/mail`
@@ -62,8 +64,8 @@ try {
 
 ## Regenerating types
 
-`src/schema.gen.ts` is generated, not hand-written. The OpenAPI spec at
-`openapi/qpost-v3-openapi.yaml` is vendored from the QPost API repo; after updating it, run:
+`src/schema.gen.ts` is generated, not hand-written. The repo-root OpenAPI spec
+`qpost-v3-openapi.yaml` is synced from the QPost API repo; after updating it, run:
 
 ```sh
 npm run generate-types

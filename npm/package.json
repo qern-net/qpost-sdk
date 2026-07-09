@@ -28,7 +28,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "generate-types": "openapi-typescript ./openapi/qpost-v3-openapi.yaml -o src/schema.gen.ts",
+    "generate-types": "openapi-typescript ../qpost-v3-openapi.yaml -o src/schema.gen.ts",
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
